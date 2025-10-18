@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <cctype>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -41,10 +43,11 @@ void GenerateCodeFiles(
         trimmedName = moduleName.substr(6, moduleName.size() - 1);
     } else if (moduleName.find("lib") != std::string::npos) {
         trimmedName = moduleName.substr(3, moduleName.size() - 1);
-        trimmedName[0] = toupper(trimmedName[0]);
+        trimmedName[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(trimmedName[0])));
     }
     std::string lowModName = trimmedName;
-    std::transform(lowModName.begin(), lowModName.end(), lowModName.begin(), ::tolower);
+    std::transform(lowModName.begin(), lowModName.end(), lowModName.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     std::string headerName(lowModName + ".h");
     headerCode += "namespace Libraries::" + trimmedName + " {\n\n";
     std::unordered_set<std::string> funcDeclares;
@@ -122,54 +125,118 @@ void GenerateCodeFiles(
 }
 
 void GetSymbolsFromLibDoc(std::vector<std::string>& importModules) {
-    for (uint32_t index = 0; index < importModules.size(); index++) {
-        const std::string& moduleName = importModules[index] + ".sprx.json";
+    const std::filesystem::path libdocDir(LIBDOC_DIR);
+    if (!std::filesystem::exists(libdocDir)) {
+        std::cerr << "Module database directory not found at: " << libdocDir << "\n"
+                  << "Please ensure the ps4libdoc submodule is initialized." << std::endl;
+        return;
+    }
 
-        std::ifstream file(LIBDOC_DIR + moduleName);
-        if (std::filesystem::exists(LIBDOC_DIR + moduleName)) {
-            printf("module found %s\n", moduleName.c_str());
-            nlohmann::json m_json_data = nlohmann::json::parse(file);
-            bool bFound = false;
-            // parse "modules": [
-            for (auto& modules : m_json_data["modules"]) {
-                std::string subModuleName =
-                    modules.at("name").get<std::string>(); // get the name of module
-                if (subModuleName == importModules[index]) {
-                    int m_version_major = modules.at("version_major").get<int>();
-                    int m_version_minor = modules.at("version_minor").get<int>();
-                    std::unordered_map<std::string, std::vector<NidFuncTable>> libName2FuncTableMap;
-                    for (auto& libraries : modules["libraries"]) {
-                        std::string libName = libraries["name"].get<std::string>();
-                        if (libName2FuncTableMap.find(libName) == libName2FuncTableMap.end()) {
-                            libName2FuncTableMap.emplace(
-                                std::make_pair(libName, std::vector<NidFuncTable>()));
-                        }
-                        int libVersion = libraries["version"].get<int>();
-                        for (auto& symbols : libraries["symbols"]) {
-                            std::string encoded_id = symbols["encoded_id"].get<std::string>();
-                            std::string hex_id = symbols["hex_id"].get<std::string>();
-                            std::string symName;
-                            if (symbols["name"] != nullptr) {
-                                symName = symbols["name"].get<std::string>();
-                            } else {
-                                symName = "Func_" + hex_id;
-                            }
+    for (const auto& importModule : importModules) {
+        const auto moduleFilename = importModule + ".sprx.json";
+        const std::filesystem::path modulePath = libdocDir / moduleFilename;
+        if (!std::filesystem::exists(modulePath)) {
+            std::cerr << "Module description missing: " << moduleFilename
+                      << " (did you update the ps4libdoc submodule?)" << std::endl;
+            continue;
+        }
 
-                            libName2FuncTableMap[libName].push_back(
-                                NidFuncTable{encoded_id, hex_id, symName, libVersion,
-                                             m_version_major, m_version_minor});
-                        }
+        std::ifstream file(modulePath);
+        if (!file.is_open()) {
+            std::cerr << "Failed to open module description: " << modulePath << std::endl;
+            continue;
+        }
+
+        nlohmann::json m_json_data;
+        try {
+            m_json_data = nlohmann::json::parse(file);
+        } catch (const nlohmann::json::parse_error& err) {
+            std::cerr << "Failed to parse " << modulePath << ": " << err.what() << std::endl;
+            continue;
+        }
+
+        if (!m_json_data.contains("modules") || !m_json_data["modules"].is_array()) {
+            std::cerr << "Invalid module description (missing 'modules' array): " << modulePath
+                      << std::endl;
+            continue;
+        }
+
+        bool bFound = false;
+        for (const auto& modules : m_json_data["modules"]) {
+            if (!modules.contains("name") || !modules["name"].is_string()) {
+                std::cerr << "Skipping malformed module entry in " << modulePath << std::endl;
+                continue;
+            }
+
+            const std::string subModuleName = modules["name"].get<std::string>();
+            if (subModuleName != importModule) {
+                continue;
+            }
+
+            if (!modules.contains("version_major") || !modules.contains("version_minor") ||
+                !modules.contains("libraries")) {
+                std::cerr << "Incomplete module information for " << subModuleName << " in "
+                          << modulePath << std::endl;
+                continue;
+            }
+
+            const int m_version_major = modules["version_major"].get<int>();
+            const int m_version_minor = modules["version_minor"].get<int>();
+
+            if (!modules["libraries"].is_array()) {
+                std::cerr << "Expected 'libraries' array for " << subModuleName << " in "
+                          << modulePath << std::endl;
+                continue;
+            }
+
+            std::unordered_map<std::string, std::vector<NidFuncTable>> libName2FuncTableMap;
+            for (const auto& libraries : modules["libraries"]) {
+                if (!libraries.contains("name") || !libraries.contains("version") ||
+                    !libraries.contains("symbols")) {
+                    std::cerr << "Skipping malformed library entry in " << modulePath
+                              << std::endl;
+                    continue;
+                }
+
+                const std::string libName = libraries["name"].get<std::string>();
+                const int libVersion = libraries["version"].get<int>();
+                const auto& symbolsArray = libraries["symbols"];
+                if (!symbolsArray.is_array()) {
+                    std::cerr << "Expected 'symbols' array for library " << libName
+                              << " in " << modulePath << std::endl;
+                    continue;
+                }
+
+                auto& functionTable = libName2FuncTableMap[libName];
+                for (const auto& symbols : symbolsArray) {
+                    if (!symbols.contains("encoded_id") || !symbols.contains("hex_id")) {
+                        std::cerr << "Skipping malformed symbol entry in " << modulePath
+                                  << std::endl;
+                        continue;
                     }
 
-                    GenerateCodeFiles(libName2FuncTableMap, subModuleName);
-                    bFound = true;
+                    const std::string encoded_id = symbols["encoded_id"].get<std::string>();
+                    const std::string hex_id = symbols["hex_id"].get<std::string>();
+
+                    std::string symName;
+                    if (symbols.contains("name") && !symbols["name"].is_null()) {
+                        symName = symbols["name"].get<std::string>();
+                    } else {
+                        symName = "Func_" + hex_id;
+                    }
+
+                    functionTable.push_back(
+                        NidFuncTable{encoded_id, hex_id, symName, libVersion, m_version_major,
+                                     m_version_minor});
                 }
             }
-            if (!bFound) {
-                printf("module can't be found %s\n", moduleName.c_str());
-            }
-        } else {
-            printf("module can't be found %s\n", moduleName.c_str());
+
+            GenerateCodeFiles(libName2FuncTableMap, subModuleName);
+            bFound = true;
+        }
+
+        if (!bFound) {
+            std::cerr << "Module entry not found inside " << moduleFilename << std::endl;
         }
     }
 }
